@@ -16,20 +16,20 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 torch.manual_seed(66)
 np.random.seed(66)
 torch.set_default_dtype(torch.float32)
-
+#使用的是一种类似二阶差分的形式去计算Laplace算子
 # define the high-order finite difference kernels
 lapl_op = [[[[    0,   0, -1/12,   0,     0],
              [    0,   0,   4/3,   0,     0],
              [-1/12, 4/3,    -5, 4/3, -1/12],
              [    0,   0,   4/3,   0,     0],
              [    0,   0, -1/12,   0,     0]]]]
-
+#使用的中心差分的方式去计算偏导数
 partial_y = [[[[0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0],
                [1/12, -8/12, 0, 8/12, -1/12],
                [0, 0, 0, 0, 0],
                [0, 0, 0, 0, 0]]]]
-
+#使用的中心差分的方式去计算偏导数
 partial_x = [[[[0, 0, 1/12, 0, 0],
                [0, 0, -8/12, 0, 0],
                [0, 0, 0, 0, 0],
@@ -257,7 +257,7 @@ class PhyCRNet(nn.Module):
 
         return outputs, second_last_state
 
-
+#用于计算偏导
 class Conv2dDerivative(nn.Module):
     def __init__(self, DerFilter, resol, kernel_size=3, name=''):
         super(Conv2dDerivative, self).__init__()
@@ -279,7 +279,7 @@ class Conv2dDerivative(nn.Module):
         derivative = self.filter(input)
         return derivative / self.resol
 
-
+#用于计算时间偏导
 class Conv1dDerivative(nn.Module):
     def __init__(self, DerFilter, resol, kernel_size=3, name=''):
         super(Conv1dDerivative, self).__init__()
@@ -300,8 +300,48 @@ class Conv1dDerivative(nn.Module):
     def forward(self, input):
         derivative = self.filter(input)
         return derivative / self.resol
+#二维时间偏导
+class Conv2dTimeDerivative(nn.Module):
+    def __init__(self, DerFilter, resol, kernel_size, name):
+        super(Conv2dTimeDerivative, self).__init__()
+        self.resol = resol
+        self.name = name
+
+        # Define a 2D convolution with a temporal derivative filter
+        DerFilter = torch.tensor(DerFilter, dtype=torch.float32).unsqueeze(1)  # Shape: (out_channels, in_channels, H, W)
+        self.filter = nn.Conv2d(
+            in_channels=1, 
+            out_channels=1, 
+            kernel_size=kernel_size, 
+            stride=1, 
+            padding=kernel_size // 2,  # Maintain spatial size
+            bias=False
+        )
+        self.filter.weight.data = DerFilter
+        self.filter.weight.requires_grad = False  # Freeze filter weights
+
+    def forward(self, x):
+        # Input shape: (timestep, channels, height, width)
+        timesteps, channels, height, width = x.shape
+        assert channels == 1, "This implementation assumes single-channel input data."
+
+        derivatives = []
+
+        for t in range(1, timesteps - 1):
+            # Extract three consecutive timesteps
+            input_data = x[t - 1:t + 2, :, :, :]  # Shape: (3, 1, height, width)
+            input_data = input_data.view(-1, 1, height, width)  # Combine time as batch size -> (3, 1, height, width)
+            
+            # Apply the 2D convolution
+            derivative = self.filter(input_data) / self.resol  # Result shape: (3, 1, height, width)
+            derivatives.append(derivative[1:2])  # Select the middle timestep derivative
+
+        # Stack derivatives along the temporal dimension
+        return torch.cat(derivatives, dim=0)  # Shape: (timestep-2, 1, height, width)
 
 
+
+#损失函数生成器
 class loss_generator(nn.Module):
     ''' Loss generator for physics loss '''
 
@@ -324,47 +364,73 @@ class loss_generator(nn.Module):
             name = 'dx_operator').cuda()
 
         self.dy = Conv2dDerivative(
-            DerFilter = partial_y,
+            DerFilter = partial_y, 
             resol = (dx*1),
             kernel_size = 5,
             name = 'dy_operator').cuda()
 
-        # temporal derivative operator
+        # temporal derivative operator，这部分考虑变化，适应于二维空间特征的时间序列
         self.dt = Conv1dDerivative(
             DerFilter = [[[-1, 0, 1]]],
             resol = (dt*2),
             kernel_size = 3,
             name = 'partial_t').cuda()
+        self.dt_1 = Conv2dTimeDerivative(
+          DerFilter = [
+    [[-1, 0, 1],  # Temporal derivative filter in x-dimension
+     [-1, 0, 1],
+     [-1, 0, 1]]],
+          resol =  (dt*2),
+          kernel_size=3,
+          name='partial_t'
+        ).cuda()
 
     def get_phy_Loss(self, output):
 
         # spatial derivatives
+        #第一个变量的所有时间刻度的Laplace变量
         laplace_u = self.laplace(output[1:-1, 0:1, :, :])  # [t,c,h,w]
+        #第二个变量的所有时间刻度的Laplace变量
         laplace_v = self.laplace(output[1:-1, 1:2, :, :])
-
+        #u在x尺度与y尺度上的一阶偏导，除初始条件之外的所有时间步的数据
         u_x = self.dx(output[1:-1, 0:1, :, :])
         u_y = self.dy(output[1:-1, 0:1, :, :])
+        #v在x尺度与y尺度上的一阶偏导，除初始条件之外的所有时间步的数据
         v_x = self.dx(output[1:-1, 1:2, :, :])
         v_y = self.dy(output[1:-1, 1:2, :, :])
+        #对时间尺度是如何计算的
+        # # temporal derivative - u
+        # u = output[:, 0:1, 2:-2, 2:-2]
+        # lent = u.shape[0]
+        # lenx = u.shape[3]
+        # leny = u.shape[2]
+        # u_conv1d = u.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+        # #拉成一维的 用于时间处理
+        # u_conv1d = u_conv1d.reshape(lenx*leny,1,lent)
+        # u_t = self.dt(u_conv1d)  # lent-2 due to no-padding
+        # u_t = u_t.reshape(leny, lenx, 1, lent-2)
+        # u_t = u_t.permute(3, 2, 0, 1)  # [step-2, c, height(Y), width(X)]
 
-        # temporal derivative - u
-        u = output[:, 0:1, 2:-2, 2:-2]
-        lent = u.shape[0]
-        lenx = u.shape[3]
-        leny = u.shape[2]
-        u_conv1d = u.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        u_conv1d = u_conv1d.reshape(lenx*leny,1,lent)
-        u_t = self.dt(u_conv1d)  # lent-2 due to no-padding
-        u_t = u_t.reshape(leny, lenx, 1, lent-2)
-        u_t = u_t.permute(3, 2, 0, 1)  # [step-2, c, height(Y), width(X)]
+        # # temporal derivative - v
+        # v = output[:, 1:2, 2:-2, 2:-2]
+        # v_conv1d = v.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+        # v_conv1d = v_conv1d.reshape(lenx*leny,1,lent)
+        # v_t = self.dt(v_conv1d)  # lent-2 due to no-padding
+        # v_t = v_t.reshape(leny, lenx, 1, lent-2)
+        # v_t = v_t.permute(3, 2, 0, 1)  # [step-2, c, height(Y), width(X)]
+        # Temporal derivatives
+        # 假设 `output` 是 4D 张量 (timestep, channel, height, width)
+        u = output[:, 0:1, 2:-2, 2:-2]  # 截取 u 分量
+        v = output[:, 1:2, 2:-2, 2:-2]  # 截取 v 分量
 
-        # temporal derivative - v
-        v = output[:, 1:2, 2:-2, 2:-2]
-        v_conv1d = v.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        v_conv1d = v_conv1d.reshape(lenx*leny,1,lent)
-        v_t = self.dt(v_conv1d)  # lent-2 due to no-padding
-        v_t = v_t.reshape(leny, lenx, 1, lent-2)
-        v_t = v_t.permute(3, 2, 0, 1)  # [step-2, c, height(Y), width(X)]
+        # 对 u 计算时间导数
+        u_t = self.dt(u)  # u_t 的形状: (timestep-2, 1, height, width)
+        print("对 u 的 t 方向导数的维度为 {}".format(u_t.shape))
+
+        # 对 v 计算时间导数
+        v_t = self.dt(v)  # v_t 的形状: (timestep-2, 1, height, width)
+        print("对 v 的 t 方向导数的维度为 {}".format(v_t.shape))
+
 
         u = output[1:-1, 0:1, 2:-2, 2:-2]  # [t, c, height(Y), width(X)]
         v = output[1:-1, 1:2, 2:-2, 2:-2]  # [t, c, height(Y), width(X)]
